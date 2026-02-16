@@ -26,9 +26,18 @@ if core_dir not in sys.path:
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QFont
+from core.path_utils import ensure_data_dirs
+# 注意：clean_orphan_thumbnails 现在在 MainWindow 初始化后调用，不在这里导入
 
 def main():
+    # ── 启动初始化：确保数据目录存在 ──────────────────────────────
+    ensure_data_dirs()
+    
     app = QApplication(sys.argv)
+    
+    # 注意：clean_orphan_thumbnails() 会在 MainWindow 初始化后自动调用
+    # 因为 MainWindow 会初始化数据库，所以这里先不调用
+    # clean_orphan_thumbnails() 现在会在 MainWindow 初始化数据库后自动处理
     
     # ── 导入 UI ─────
     # 必须在 QApplication 创建之后导入，因为 ui 模块中有初始化 QPixmap 的代码

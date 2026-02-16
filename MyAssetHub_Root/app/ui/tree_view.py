@@ -1,18 +1,23 @@
 """
 Asset Tree View - 合并了 core/tree_view.py 的高级逻辑
 提供文件夹树状浏览、右键菜单（新建/重命名/删除）、快捷键支持
+【新增】支持接收从网格拖入的文件（移动/复制到目标文件夹）
+【新增】支持接收从外部拖入的文件
 """
-
 import os
 import shutil
 import logging
+from pathlib import Path
+
+from core.db_manager import DatabaseManager
+from core.watcher import move_asset
 
 from PySide6.QtWidgets import (
     QTreeView, QAbstractItemView, QStyledItemDelegate,
     QStyle, QMenu, QInputDialog, QMessageBox, QFileSystemModel
 )
 from PySide6.QtCore import (
-    Qt, QDir, QSize, QRect, QModelIndex, Signal
+    Qt, QDir, QSize, QRect, QModelIndex, Signal, QUrl
 )
 from PySide6.QtGui import (
     QPixmap, QPainter, QIcon,
@@ -21,20 +26,21 @@ from PySide6.QtGui import (
 
 logger = logging.getLogger(__name__)
 
+# 【新增】树可接收的文件格式
+TREE_DROP_ALLOWED = {
+    ".fbx", ".obj", ".abc", ".gltf", ".glb", ".max",
+    ".jpg", ".jpeg", ".png", ".tga",
+}
+
 
 class ThumbnailDelegate(QStyledItemDelegate):
     """为树状视图中的项目显示缩略图图标"""
     ICON_SIZE = 20
 
     def paint(self, painter, option, index):
-        # 1. 初始化样式选项以包含模型数据（如文字、图标等）
         self.initStyleOption(option, index)
-        
-        # 2. 调用基类绘制（处理背景、文字颜色、高亮等）
-        # 这会自动应用 QTreeView 的样式表设置
         super().paint(painter, option, index)
 
-        # 3. 尝试加载并覆盖缩略图
         path = index.model().filePath(index) if hasattr(index.model(), 'filePath') else ""
         if path and os.path.isdir(path):
             thumb = os.path.join(path, ".thumbnail.png")
@@ -44,20 +50,16 @@ class ThumbnailDelegate(QStyledItemDelegate):
                     Qt.KeepAspectRatio, Qt.SmoothTransformation
                 )
                 if not pix.isNull():
-                    # 获取图标应该出现的位置
                     icon_rect = self.parent().style().subElementRect(
                         QStyle.SE_ItemViewItemIcon, option, self.parent()
                     )
-                    
                     if not icon_rect.isValid():
                         icon_rect = QRect(
                             option.rect.x() + 2,
                             option.rect.y() + (option.rect.height() - self.ICON_SIZE) // 2,
                             self.ICON_SIZE, self.ICON_SIZE
                         )
-
                     painter.save()
-                    # 根据是否选中选择背景色覆盖原图标
                     bg_color = option.palette.highlight().color() if option.state & QStyle.State_Selected else option.palette.base().color()
                     painter.fillRect(icon_rect, bg_color)
                     painter.drawPixmap(icon_rect, pix)
@@ -70,41 +72,43 @@ class ThumbnailDelegate(QStyledItemDelegate):
 
 class CustomFileSystemModel(QFileSystemModel):
     """自定义文件系统模型，确保 hasChildren 逻辑只针对文件夹"""
+
     def hasChildren(self, parent):
         if not parent.isValid():
             return super().hasChildren(parent)
-        
-        # 如果不是文件夹，肯定没有子节点
         if not self.isDir(parent):
             return False
-            
-        # 检查文件夹下是否有符合过滤条件的子项（即是否有子文件夹）
         path = self.filePath(parent)
         try:
-            # 这里的逻辑要和 setFilter 保持一致
-            # 我们只关心是否有子文件夹
             it = QDir(path).entryInfoList(QDir.Dirs | QDir.NoDotAndDotDot)
             return len(it) > 0
         except:
             return False
 
+
 class AssetTreeWidget(QTreeView):
     """
     资产树状视图 - 显示文件夹结构
+
     功能：
     - QFileSystemModel 驱动的文件夹浏览
     - 右键菜单：新建文件夹、重命名、删除
     - 快捷键：F2(重命名)、Delete(删除)、Ctrl+N(新建文件夹)
-    - 拖放支持
+    - 拖放支持（文件夹之间移动）
+    - 【新增】接收从网格拖入的文件（移动到目标文件夹）
+    - 【新增】接收从外部拖入的文件（复制到目标文件夹）
     - 缩略图委托
     """
 
-    # 自定义信号：当文件夹结构发生变化时发出
-    folder_created = Signal(str)    # 参数: 新文件夹路径
-    folder_renamed = Signal(str, str)  # 参数: 旧路径, 新路径
-    folder_deleted = Signal(str)    # 参数: 被删除的文件夹路径
-    folder_changed = Signal()       # 通用变化信号
-    folderSelected = Signal(str)    # 参数: 选中文件夹的绝对路径
+    # 自定义信号
+    folder_created = Signal(str)
+    folder_renamed = Signal(str, str)
+    folder_deleted = Signal(str)
+    folder_changed = Signal()
+    folderSelected = Signal(str)
+
+    # 【新增】文件被移动/复制到文件夹的信号
+    filesDropped = Signal(str)  # 参数: 目标文件夹路径
 
     def __init__(self, root_path="", parent=None):
         super().__init__(parent)
@@ -112,9 +116,9 @@ class AssetTreeWidget(QTreeView):
 
         # ── 文件系统模型 ──
         self._fs_model = CustomFileSystemModel(self)
-        # 恢复为只显示文件夹，不显示文件
         self._fs_model.setFilter(QDir.Dirs | QDir.NoDotAndDotDot)
         self._fs_model.setNameFilterDisables(False)
+
         self.setModel(self._fs_model)
 
         # 只显示名称列
@@ -126,17 +130,17 @@ class AssetTreeWidget(QTreeView):
         self.setAnimated(True)
         self.setIndentation(20)
         self.setExpandsOnDoubleClick(True)
-        self.setEditTriggers(QAbstractItemView.NoEditTriggers)  # 禁止直接编辑，用对话框代替
+        self.setEditTriggers(QAbstractItemView.NoEditTriggers)
 
         # ── 右键菜单 ──
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
 
-        # ── 拖放 ──
+        # ── 【修改】拖放配置 — 支持接收文件 ──
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
-        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDragDropMode(QAbstractItemView.DragDrop)  # 改为 DragDrop 以支持外部拖入
         self.setDefaultDropAction(Qt.MoveAction)
 
         # ── 缩略图委托 ──
@@ -160,9 +164,8 @@ class AssetTreeWidget(QTreeView):
             path = self._fs_model.filePath(index)
             self.folderSelected.emit(path)
 
-
     # ================================================================
-    #  公共接口
+    # 公共接口
     # ================================================================
 
     def set_root_path(self, path: str):
@@ -189,8 +192,6 @@ class AssetTreeWidget(QTreeView):
     def refresh(self):
         """刷新文件系统模型"""
         if self._root_path:
-            # QFileSystemModel 使用文件系统监视器自动刷新，
-            # 但我们可以通过重新设置根路径来强制刷新
             current = self.currentIndex()
             root_index = self._fs_model.setRootPath("")
             root_index = self._fs_model.setRootPath(self._root_path)
@@ -200,22 +201,19 @@ class AssetTreeWidget(QTreeView):
             logger.debug("Tree view refreshed")
 
     # ================================================================
-    #  右键菜单
+    # 右键菜单
     # ================================================================
 
     def _show_context_menu(self, position):
         """显示右键上下文菜单"""
         menu = QMenu(self)
-
         index = self.indexAt(position)
 
-        # 新建文件夹 - 始终可用
         action_new = QAction("📁 新建文件夹", self)
         action_new.setShortcut(QKeySequence("Ctrl+N"))
         action_new.triggered.connect(lambda: self._create_folder(index))
         menu.addAction(action_new)
 
-        # 以下操作仅在选中了有效项时可用
         if index.isValid():
             menu.addSeparator()
 
@@ -224,7 +222,7 @@ class AssetTreeWidget(QTreeView):
             action_rename.triggered.connect(lambda: self._rename_folder(index))
             menu.addAction(action_rename)
 
-            action_delete = QAction("🗑️ 删除", self)
+            action_delete = QAction("🗑 删除", self)
             action_delete.setShortcut(QKeySequence(Qt.Key_Delete))
             action_delete.triggered.connect(lambda: self._delete_folder(index))
             menu.addAction(action_delete)
@@ -240,7 +238,7 @@ class AssetTreeWidget(QTreeView):
         menu.exec_(self.viewport().mapToGlobal(position))
 
     # ================================================================
-    #  文件夹操作
+    # 文件夹操作
     # ================================================================
 
     def _create_folder(self, parent_index: QModelIndex = QModelIndex()):
@@ -263,7 +261,6 @@ class AssetTreeWidget(QTreeView):
         name = name.strip()
         new_path = os.path.join(parent_path, name)
 
-        # 检查是否已存在
         if os.path.exists(new_path):
             QMessageBox.warning(
                 self, "错误",
@@ -275,14 +272,11 @@ class AssetTreeWidget(QTreeView):
             os.makedirs(new_path, exist_ok=False)
             logger.info(f"Created folder: {new_path}")
 
-            # 展开父节点以显示新文件夹
             if parent_index.isValid():
                 self.expand(parent_index)
 
-            # 选中新创建的文件夹
             self._select_path(new_path)
 
-            # 发出信号
             self.folder_created.emit(new_path)
             self.folder_changed.emit()
 
@@ -302,7 +296,6 @@ class AssetTreeWidget(QTreeView):
         old_name = self._fs_model.fileName(index)
         parent_path = os.path.dirname(old_path)
 
-        # 不允许重命名根目录
         if old_path == self._root_path:
             QMessageBox.warning(self, "错误", "不能重命名根目录。")
             return
@@ -315,11 +308,10 @@ class AssetTreeWidget(QTreeView):
 
         new_name = new_name.strip()
         if new_name == old_name:
-            return  # 没有变化
+            return
 
         new_path = os.path.join(parent_path, new_name)
 
-        # 检查是否已存在
         if os.path.exists(new_path):
             QMessageBox.warning(
                 self, "错误",
@@ -331,10 +323,8 @@ class AssetTreeWidget(QTreeView):
             os.rename(old_path, new_path)
             logger.info(f"Renamed folder: {old_path} -> {new_path}")
 
-            # 选中重命名后的文件夹
             self._select_path(new_path)
 
-            # 发出信号
             self.folder_renamed.emit(old_path, new_path)
             self.folder_changed.emit()
 
@@ -353,12 +343,10 @@ class AssetTreeWidget(QTreeView):
         folder_path = self._fs_model.filePath(index)
         folder_name = self._fs_model.fileName(index)
 
-        # 不允许删除根目录
         if folder_path == self._root_path:
             QMessageBox.warning(self, "错误", "不能删除根目录。")
             return
 
-        # 确认对话框
         reply = QMessageBox.question(
             self, "确认删除",
             f"确定要删除文件夹 \"{folder_name}\" 及其所有内容吗？\n\n"
@@ -373,9 +361,10 @@ class AssetTreeWidget(QTreeView):
 
         try:
             shutil.rmtree(folder_path)
+            db = DatabaseManager()
+            db.delete_assets_by_folder(folder_path)  # 删除数据库中整个文件夹的记录
             logger.info(f"Deleted folder: {folder_path}")
 
-            # 发出信号
             self.folder_deleted.emit(folder_path)
             self.folder_changed.emit()
 
@@ -410,7 +399,7 @@ class AssetTreeWidget(QTreeView):
             logger.error(f"Failed to open in explorer: {e}")
 
     # ================================================================
-    #  快捷键
+    # 快捷键
     # ================================================================
 
     def keyPressEvent(self, event):
@@ -419,66 +408,79 @@ class AssetTreeWidget(QTreeView):
         modifiers = event.modifiers()
         index = self.currentIndex()
 
-        # F2 → 重命名
         if key == Qt.Key_F2 and index.isValid():
             self._rename_folder(index)
             event.accept()
             return
 
-        # Delete → 删除
         if key == Qt.Key_Delete and index.isValid():
             self._delete_folder(index)
             event.accept()
             return
 
-        # Ctrl+N → 新建文件夹
         if key == Qt.Key_N and (modifiers & Qt.ControlModifier):
             self._create_folder(index)
             event.accept()
             return
 
-        # 其余键交给基类处理（方向键展开/折叠等）
         super().keyPressEvent(event)
 
     # ================================================================
-    #  拖放
+    # 拖放 — 从树中拖出文件夹
     # ================================================================
 
     def startDrag(self, supportedActions):
-        """开始拖动"""
+        """开始拖动文件夹"""
         index = self.currentIndex()
         if not index.isValid():
             return
 
         path = self._fs_model.filePath(index)
+
         drag = QDrag(self)
-        from PySide6.QtCore import QMimeData, QUrl
+        from PySide6.QtCore import QMimeData
         mime = QMimeData()
         mime.setUrls([QUrl.fromLocalFile(path)])
         mime.setText(path)
         drag.setMimeData(mime)
 
-        # 拖动时显示的图标
         icon = self._fs_model.fileIcon(index)
         if not icon.isNull():
             drag.setPixmap(icon.pixmap(32, 32))
 
         drag.exec_(Qt.MoveAction | Qt.CopyAction)
 
+    # ================================================================
+    # 【修改】拖放 — 接收拖入（文件夹移动 + 文件移动/复制）
+    # ================================================================
+
     def dragEnterEvent(self, event):
+        """接受包含文件URL的拖拽"""
         if event.mimeData().hasUrls() or event.mimeData().hasText():
             event.acceptProposedAction()
         else:
             super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
+        """拖拽移动时高亮目标文件夹"""
         if event.mimeData().hasUrls() or event.mimeData().hasText():
+            # 获取鼠标下方的文件夹索引
+            index = self.indexAt(event.position().toPoint())
+            if index.isValid():
+                # 自动展开悬停的文件夹（方便拖入子文件夹）
+                self.setCurrentIndex(index)
             event.acceptProposedAction()
         else:
             super().dragMoveEvent(event)
 
     def dropEvent(self, event):
-        """处理放下事件 - 移动文件夹"""
+        """
+        【增强】处理放下事件：
+        1. 文件夹拖到文件夹上 → 移动文件夹（原有功能）
+        2. 文件拖到文件夹上 → 移动文件（从复制改为移动）
+        3. 外部文件拖到文件夹上 → 移动文件（从复制改为移动）
+        """
+        # 确定目标文件夹
         target_index = self.indexAt(event.position().toPoint())
         if not target_index.isValid():
             target_path = self._root_path
@@ -490,24 +492,118 @@ class AssetTreeWidget(QTreeView):
             return
 
         mime = event.mimeData()
+
         if mime.hasUrls():
+            moved_count = 0
+            copied_count = 0
+            error_list = []
+
             for url in mime.urls():
                 src = url.toLocalFile()
-                if os.path.exists(src) and src != target_path:
-                    dest = os.path.join(target_path, os.path.basename(src))
+
+                if not os.path.exists(src):
+                    continue
+
+                # 不能拖到自己所在的目录
+                if os.path.abspath(os.path.dirname(src)) == os.path.abspath(target_path):
+                    continue
+
+                # 不能拖到自己（文件夹拖到自己）
+                if os.path.abspath(src) == os.path.abspath(target_path):
+                    continue
+
+                file_name = os.path.basename(src)
+                dest = os.path.join(target_path, file_name)
+
+                # ── 判断是文件夹还是文件 ──
+                if os.path.isdir(src):
+                    # 文件夹 → 移动
                     if not os.path.exists(dest):
                         try:
                             shutil.move(src, dest)
-                            logger.info(f"Moved: {src} -> {dest}")
-                            self.folder_changed.emit()
+                            # === 新增：数据库同步 ===
+                            db = DatabaseManager()
+                            db.move_folder_assets(src, dest)  # 文件夹移动，递归更新路径
+                            # === 结束 ===
+                            moved_count += 1
+                            logger.info(f"Moved folder: {src} -> {dest}")
                         except Exception as e:
-                            logger.error(f"Move failed: {e}")
+                            error_list.append(f"{file_name}（{e}）")
+                            logger.error(f"Move folder failed: {e}")
+                    else:
+                        error_list.append(f"{file_name}（目标已存在）")
+
+                elif os.path.isfile(src):
+                    # 文件 → 判断是内部移动还是外部复制
+                    # 检查源文件是否在我们的根目录下（内部操作 → 移动）
+                    is_internal = os.path.abspath(src).startswith(
+                        os.path.abspath(self._root_path)
+                    )
+
+                    # 同名文件处理
+                    if os.path.exists(dest):
+                        reply = QMessageBox.question(
+                            self, "文件已存在",
+                            f"文件 \"{file_name}\" 在目标文件夹中已存在。\n\n是否覆盖？",
+                            QMessageBox.Yes | QMessageBox.No,
+                            QMessageBox.No
+                        )
+                        if reply == QMessageBox.No:
+                            continue
+                        # 删除已存在的文件以便覆盖
+                        try:
+                            os.remove(dest)
+                        except Exception as e:
+                            error_list.append(f"{file_name}（无法覆盖: {e}）")
+                            continue
+
+                    try:
+                        # 无论是内部还是外部文件，统一改为移动
+                        if Path(src).suffix.lower() in [".fbx", ".obj"]:  # 只对模型文件用绑定移动
+                            success = move_asset(src, os.path.dirname(dest))  # dest是完整路径，取文件夹
+                        else:
+                            shutil.move(src, dest)  # 其他文件正常移动
+                        # === 新增：数据库同步 ===
+                        db = DatabaseManager()
+                        db.move_file_asset(src, dest)      # 单个文件移动，保留元数据
+                        # === 结束 ===
+                        moved_count += 1
+                        logger.info(f"Moved file: {src} -> {dest}")
+                    except PermissionError:
+                        error_list.append(f"{file_name}（权限不足）")
+                    except Exception as e:
+                        error_list.append(f"{file_name}（{e}）")
+
+            # 显示结果
+            if moved_count > 0 or error_list:
+                msg_parts = []
+                if moved_count > 0:
+                    msg_parts.append(f"✅ 移动了 {moved_count} 个项目")
+                if error_list:
+                    msg_parts.append(f"❌ 失败 {len(error_list)} 个：")
+                    for err in error_list:
+                        msg_parts.append(f"    • {err}")
+
+                QMessageBox.information(
+                    self, "拖拽操作完成",
+                    "\n".join(msg_parts)
+                )
+
+            # 发出信号通知刷新
+            if moved_count > 0:
+                # === 新增：全局清理 ===
+                db = DatabaseManager()
+                db.delete_missing_assets()  # 保险清理
+                # === 结束 ===
+                self.folder_changed.emit()
+                self.filesDropped.emit(target_path)
+
             event.acceptProposedAction()
         else:
             super().dropEvent(event)
 
     # ================================================================
-    #  辅助方法
+    # 辅助方法
     # ================================================================
 
     def _select_path(self, path: str):

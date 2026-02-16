@@ -14,6 +14,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional, Generator
 
+# 导入路径工具
+try:
+    from path_utils import get_db_path
+except ImportError:
+    # 如果导入失败（可能是循环导入），使用备用方案
+    def get_db_path():
+        return os.path.join("data", "library.db")
+
 
 # ══════════════════════════════════════════════════════════════════
 #  数据模型
@@ -118,13 +126,15 @@ class DatabaseManager:
         "CREATE INDEX IF NOT EXISTS idx_mtime ON assets(mtime)",
     ]
 
-    def __init__(self, db_path: str = "assets.db"):
+    def __init__(self, db_path: str = None):
         """
         初始化数据库管理器。
         
         Args:
-            db_path: 数据库文件路径，默认为当前目录下的 assets.db
+            db_path: 数据库文件路径，如果为 None 则使用默认路径 data/library.db
         """
+        if db_path is None:
+            db_path = get_db_path()
         self._db_path = os.path.abspath(db_path)
         self._local = threading.local()
         self._lock = threading.RLock()
@@ -342,26 +352,28 @@ class DatabaseManager:
         更新现有资产记录。
         
         Args:
-            asset: 资产记录（需要包含 file_path）
+            asset: 资产记录（需要包含 ID）
             
         Returns:
             是否成功更新
         """
         sql = """
             UPDATE assets SET
+                file_path = ?,
                 file_name = ?,
                 thumb_path = ?,
                 file_size = ?,
                 mtime = ?
-            WHERE file_path = ?
+            WHERE id = ?
         """
         with self._cursor() as cursor:
             cursor.execute(sql, (
+                asset.file_path,
                 asset.file_name,
                 asset.thumb_path,
                 asset.file_size,
                 asset.mtime,
-                asset.file_path,
+                asset.id,
             ))
             return cursor.rowcount > 0
 
@@ -412,6 +424,30 @@ class DatabaseManager:
             cursor.execute(sql, params)
             return cursor.rowcount > 0
 
+    def move_file_asset(self, old_path: str, new_path: str) -> bool:
+        """移动单个资产文件时更新数据库路径和文件名（保留 comment/tags 等元数据）"""
+        record = self.get_asset_by_path(old_path)
+        if not record:
+            return False
+        record.file_path = new_path
+        record.file_name = os.path.basename(new_path)
+        # thumb_path 会由后续扫描重新匹配，无需手动更新
+        return self.update_asset(record)
+
+    def move_folder_assets(self, old_folder: str, new_folder: str) -> int:
+        """递归移动整个文件夹下的资产时更新路径（保留元数据）"""
+        old_prefix = os.path.abspath(old_folder) + os.sep
+        new_prefix = os.path.abspath(new_folder) + os.sep
+        assets = self.get_assets_by_folder(old_folder)
+        updated = 0
+        for record in assets:
+            if record.file_path.startswith(old_prefix):
+                record.file_path = new_prefix + record.file_path[len(old_prefix):]
+                record.file_name = os.path.basename(record.file_path)
+                if self.update_asset(record):
+                    updated += 1
+        return updated
+
     # ================================================================
     #  配置操作
     # ================================================================
@@ -456,7 +492,7 @@ class DatabaseManager:
 
     def get_asset_by_path(self, file_path: str) -> Optional[AssetRecord]:
         """根据文件路径获取资产记录。"""
-        sql = "SELECT id, file_path, file_name, thumb_path, file_size, mtime FROM assets WHERE file_path = ?"
+        sql = "SELECT id, file_path, file_name, thumb_path, file_size, mtime, comment, tags FROM assets WHERE file_path = ?"
         with self._cursor() as cursor:
             cursor.execute(sql, (file_path,))
             row = cursor.fetchone()
@@ -617,6 +653,34 @@ class DatabaseManager:
             cursor.execute(sql, missing_ids)
             return cursor.rowcount
 
+    def delete_non_supported_assets(self) -> int:
+        """
+        删除不支持的资产类型记录。
+        
+        Returns:
+            删除的记录数
+        """
+        # 支持的 3D 模型格式
+        MODEL_EXTENSIONS = {".fbx", ".obj", ".abc", ".gltf", ".glb", ".max"}
+        
+        assets = self.get_all_assets()
+        non_supported_ids = []
+        
+        for asset in assets:
+            ext = os.path.splitext(asset.file_path)[1].lower()
+            if ext not in MODEL_EXTENSIONS:
+                non_supported_ids.append(asset.id)
+        
+        if not non_supported_ids:
+            return 0
+        
+        placeholders = ",".join("?" * len(non_supported_ids))
+        sql = f"DELETE FROM assets WHERE id IN ({placeholders})"
+        
+        with self._cursor() as cursor:
+            cursor.execute(sql, non_supported_ids)
+            return cursor.rowcount
+
     # ================================================================
     #  统计信息
     # ================================================================
@@ -675,13 +739,13 @@ _db_instance: Optional[DatabaseManager] = None
 _db_lock = threading.Lock()
 
 
-def get_database(db_path: str = "assets.db") -> DatabaseManager:
+def get_database(db_path: str = None) -> DatabaseManager:
     """
     获取数据库管理器单例。
     
     Args:
-        db_path: 数据库文件路径
-        
+        db_path: 数据库文件路径，如果为 None 则使用默认路径 data/library.db
+    
     Returns:
         DatabaseManager 实例
     """

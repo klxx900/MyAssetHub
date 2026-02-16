@@ -10,6 +10,7 @@
 import os
 import hashlib
 import time
+import shutil
 from pathlib import Path
 from typing import Optional, Callable
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ except ImportError:
     print("[Warning] Pillow 未安装，缩略图功能将不可用")
     print("         请运行: pip install Pillow")
 
-from db_manager import DatabaseManager, AssetRecord
+from db_manager import DatabaseManager, AssetRecord, get_database
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -30,7 +31,7 @@ from db_manager import DatabaseManager, AssetRecord
 # ══════════════════════════════════════════════════════════════════
 
 # 支持的 3D 模型格式
-MODEL_EXTENSIONS = {".fbx", ".obj", ".max", ".abc", ".blend", ".gltf", ".glb"}
+MODEL_EXTENSIONS = {".fbx", ".obj", ".abc", ".gltf", ".glb", ".max"}
 
 # 用于查找配对缩略图的图片格式
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tga", ".bmp"}
@@ -38,7 +39,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tga", ".bmp"}
 # 缩略图尺寸
 THUMBNAIL_SIZE = (256, 256)
 
-# 缩略图缓存目录（相对于项目根目录）
+# 缩略图缓存目录（将使用 path_utils 获取绝对路径）
 CACHE_DIR = os.path.join("data", ".cache")
 
 # 隐藏文件夹（扫描时跳过）
@@ -65,6 +66,7 @@ class ScanResult:
     updated_assets: int = 0
     skipped_assets: int = 0
     thumbnails_generated: int = 0
+    deleted_assets: int = 0
     errors: list = None
 
     def __post_init__(self):
@@ -77,6 +79,7 @@ class ScanResult:
             f"新增 {self.new_assets}, 更新 {self.updated_assets}, "
             f"跳过 {self.skipped_assets}, "
             f"生成缩略图 {self.thumbnails_generated}, "
+            f"清理幽灵 {self.deleted_assets}, "
             f"错误 {len(self.errors)}"
         )
 
@@ -94,9 +97,15 @@ def get_cache_dir() -> str:
     Returns:
         缓存目录的绝对路径
     """
-    # 尝试从项目根目录开始
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    cache_path = os.path.join(base_dir, CACHE_DIR)
+    # 使用 path_utils 获取缓存目录路径（兼容 EXE 打包）
+    try:
+        from path_utils import get_cache_dir as _get_cache_dir_from_utils
+        cache_path = _get_cache_dir_from_utils()
+    except ImportError:
+        # 如果导入失败（可能是循环导入），使用备用方案
+        # 获取 app 目录的路径 (MyAssetHub_Root/app)
+        app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cache_path = os.path.join(app_dir, CACHE_DIR)
 
     # 确保目录存在
     os.makedirs(cache_path, exist_ok=True)
@@ -204,6 +213,8 @@ def generate_placeholder_thumbnail(
         "blend": (255, 165, 0),    # 橙色
         "gltf": (97, 175, 239),    # 蓝色
         "glb": (86, 182, 194),     # 青色
+        "txt": (171, 178, 191),    # 灰色
+        "pdf": (209, 73, 78),      # 红色 (PDF 典型色)
     }
 
     bg_color = ext_colors.get(ext_clean, (100, 100, 100))
@@ -410,8 +421,11 @@ def scan_folder(
             existing = db.get_asset_by_path(model_path)
 
             if existing:
-                # 检查是否需要更新（文件已修改）
-                if existing.mtime >= mtime:
+                # 检查是否需要更新（文件已修改，或者缩略图之前没有现在有了）
+                has_thumbnail = existing.thumb_path and os.path.exists(existing.thumb_path)
+                
+                # 如果文件没变，且已经有缩略图了，才跳过
+                if existing.mtime >= mtime and has_thumbnail:
                     result.skipped_assets += 1
                     continue
 
@@ -456,6 +470,19 @@ def scan_folder(
             db.upsert_assets_batch(assets_to_insert)
         except Exception as e:
             result.errors.append(f"数据库写入失败: {e}")
+
+    # ── 第四阶段：清理幽灵记录 ────────────────────────────────
+    # 扫描结束后清理该文件夹下的幽灵记录
+    deleted = 0
+    for asset in db.get_assets_by_folder(folder_path):
+        if not os.path.exists(asset.file_path):
+            try:
+                db.delete_asset_by_path(asset.file_path)
+                deleted += 1
+            except Exception as e:
+                result.errors.append(f"清理幽灵记录失败 [{asset.file_path}]: {e}")
+
+    result.deleted_assets = deleted
 
     return result
 
@@ -573,6 +600,115 @@ def get_cache_size() -> tuple[int, str]:
 # ══════════════════════════════════════════════════════════════════
 #  命令行测试
 # ══════════════════════════════════════════════════════════════════
+
+def move_asset(source_path: str, target_folder: str):
+    """移动模型文件，并自动带走同名的贴图文件（jpg/png等）"""
+    if not os.path.exists(source_path):
+        return False
+    
+    # 获取文件名（无后缀）和原目录
+    source_dir = os.path.dirname(source_path)
+    base_name = os.path.splitext(os.path.basename(source_path))[0]
+    
+    # 1. 移动主模型文件（如果目标已有同名，覆盖）
+    target_model_path = os.path.join(target_folder, os.path.basename(source_path))
+    if os.path.exists(target_model_path):
+        os.remove(target_model_path)  # 覆盖
+    shutil.move(source_path, target_folder)
+    
+    # 2. 移动同名贴图（常见的5种格式）
+    image_extensions = ['.jpg', '.jpeg', '.png', '.tga', '.bmp']
+    moved_images = 0
+    for ext in image_extensions:
+        image_path = os.path.join(source_dir, base_name + ext)
+        if os.path.exists(image_path):
+            target_image_path = os.path.join(target_folder, base_name + ext)
+            if os.path.exists(target_image_path):
+                os.remove(target_image_path)  # 覆盖
+            shutil.move(image_path, target_folder)
+            moved_images += 1
+    
+    print(f"移动模型成功，并带走 {moved_images} 张同名贴图")
+    return True
+
+
+def clean_orphan_thumbnails():
+    """清理 .cache 里无用的缩略图垃圾（保留正在使用的和 placeholder）"""
+    valid_thumbs = set()
+    
+    try:
+        db = DatabaseManager()
+        # 确保数据库已初始化
+        db.initialize()
+        
+        # 尝试获取数据库里所有正在使用的缩略图路径（白名单）
+        # 如果表不存在，会抛出异常，我们捕获它
+        try:
+            assets = db.get_all_assets()
+            valid_thumbs = {asset.thumb_path for asset in assets if asset.thumb_path}
+        except Exception as db_error:
+            # 如果表不存在或其他数据库错误，使用空白名单
+            print(f"[Warning] 无法读取数据库，跳过缩略图清理: {db_error}")
+            valid_thumbs = set()
+    except Exception as e:
+        # 如果数据库初始化失败，使用空白名单（清理所有非 placeholder 文件）
+        print(f"[Warning] 数据库初始化失败，跳过缩略图清理: {e}")
+        valid_thumbs = set()
+    
+    cache_dir = get_cache_dir()  # data/.cache
+    if not os.path.exists(cache_dir):
+        return
+    
+    deleted_count = 0
+    for filename in os.listdir(cache_dir):
+        file_path = os.path.join(cache_dir, filename)
+        if not os.path.isfile(file_path):
+            continue
+            
+        # 跳过 placeholder 开头的系统占位图
+        if filename.startswith("placeholder"):
+            continue
+            
+        # 如果不在白名单里，就是垃圾 → 删除
+        if file_path not in valid_thumbs:
+            try:
+                os.remove(file_path)
+                deleted_count += 1
+                print(f"已删除垃圾缩略图: {filename}")
+            except Exception as e:
+                print(f"删除失败 {filename}: {e}")
+    
+    print(f"缩略图大扫除完成！共删除 {deleted_count} 个垃圾文件")
+
+def delete_asset(file_path: str):
+    """彻底删除一个资产：缩略图 + 模型文件 + 数据库记录"""
+    if not os.path.exists(file_path):
+        return False
+        
+    db = DatabaseManager()
+    
+    # 1. 先查出这模型对应的缩略图路径
+    asset = db.get_asset_by_path(file_path)
+    if asset and asset.thumb_path and os.path.exists(asset.thumb_path):
+        try:
+            os.remove(asset.thumb_path)
+            print(f"已删除缩略图: {asset.thumb_path}")
+        except Exception as e:
+            print(f"缩略图删除失败: {e}")
+    
+    # 2. 再删模型文件本身
+    try:
+        os.remove(file_path)
+        print(f"已删除模型文件: {file_path}")
+    except Exception as e:
+        print(f"模型文件删除失败: {e}")
+        return False
+    
+    # 3. 最后删数据库记录
+    db.delete_asset_by_path(file_path)
+    print(f"已从数据库移除记录: {file_path}")
+    return True
+
 
 if __name__ == "__main__":
     import sys

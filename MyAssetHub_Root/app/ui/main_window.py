@@ -20,7 +20,10 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QPushButton,
     QSizePolicy,
+    QCheckBox,
+    QToolButton,
 )
+from PySide6.QtGui import QClipboard, QIcon
 from PySide6.QtCore import Qt, QSize, QThread, Signal
 from PySide6.QtGui import QFont, QPixmap, QColor, QPainter, QPolygonF
 from PySide6.QtCore import QPointF
@@ -556,6 +559,10 @@ class PropertiesPanel(QFrame):
         # ── 路径 ──────────────────────────────────────────────────
         layout.addWidget(_SectionHeader("文件路径"))
 
+        path_layout = QHBoxLayout()
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        path_layout.setSpacing(8)
+
         self._path_edit = QLineEdit()
         self._path_edit.setReadOnly(True)
         self._path_edit.setPlaceholderText("—")
@@ -571,7 +578,16 @@ class PropertiesPanel(QFrame):
             }}
             """
         )
-        layout.addWidget(self._path_edit)
+        path_layout.addWidget(self._path_edit, 1)
+
+        # 路径复制按钮
+        copy_btn = QToolButton()
+        copy_btn.setText("📋")
+        copy_btn.setToolTip("复制文件路径")
+        copy_btn.clicked.connect(self.copy_path_to_clipboard)
+        path_layout.addWidget(copy_btn)
+
+        layout.addLayout(path_layout)
 
         # ── 备注 ──────────────────────────────────────────────────
         layout.addWidget(_SectionHeader("备注"))
@@ -604,7 +620,8 @@ class PropertiesPanel(QFrame):
         self._path_edit.setText(file_path)
         self._path_edit.setToolTip(file_path)
 
-        # 加载数据库中的备注
+        # 加载数据库中的信息 (备注 & 缩略图路径)
+        asset = None
         if self._db:
             asset = self._db.get_asset_by_path(file_path)
             self._notes_edit.blockSignals(True)
@@ -614,9 +631,19 @@ class PropertiesPanel(QFrame):
                 self._notes_edit.clear()
             self._notes_edit.blockSignals(False)
 
-        # 图片缩略图
-        if ext in (".png", ".jpg", ".jpeg", ".tga"):
-            pm = QPixmap(file_path)
+        # 缩略图显示逻辑
+        thumb_file = ""
+        
+        # 1. 优先尝试从数据库获取缩略图路径
+        if asset and asset.thumb_path and os.path.isfile(asset.thumb_path):
+            thumb_file = asset.thumb_path
+        
+        # 2. 如果数据库没有缩略图，且文件本身是图片，则使用文件本身
+        if not thumb_file and ext in (".png", ".jpg", ".jpeg", ".tga"):
+            thumb_file = file_path
+
+        if thumb_file:
+            pm = QPixmap(thumb_file)
             if not pm.isNull():
                 pm = pm.scaled(
                     self._thumb_label.size(),
@@ -678,6 +705,14 @@ class PropertiesPanel(QFrame):
             }}
             """
         )
+
+    def copy_path_to_clipboard(self):
+        """复制文件路径到剪贴板。"""
+        if self._current_asset_path:
+            QApplication.clipboard().setText(self._current_asset_path)
+            # 显示状态消息（如果有父窗口的状态栏）
+            if self.parent() and hasattr(self.parent(), "statusBar"):
+                self.parent().statusBar().showMessage("文件路径已复制到剪贴板", 2000)
 
     def _on_notes_changed(self) -> None:
         """当备注内容改变时，自动保存到数据库。"""
@@ -755,7 +790,20 @@ class MainWindow(QMainWindow):
         # ── 初始化数据库 ──────────────────────────────────────────
         self._db = DatabaseManager()
         self._db.initialize()
+        self._db.delete_non_supported_assets()  # 启动时自动清理一次
+        
+        # 程序启动时自动清理一次缩略图垃圾（数据库已初始化，可以安全调用）
+        try:
+            from core.watcher import clean_orphan_thumbnails
+            clean_orphan_thumbnails()
+        except Exception as e:
+            print(f"[Warning] 清理缩略图失败: {e}")
+        
         self._scan_thread = None  # 扫描线程句柄
+        
+        # 添加成员变量
+        self.search_edit = None
+        self.current_folder = ""
 
         # 如果没有传入路径，则尝试从数据库加载上次的路径
         if not root_path:
@@ -818,6 +866,10 @@ class MainWindow(QMainWindow):
         self._tree.folderSelected.connect(self._on_folder_selected)
         self._grid.assetSelected.connect(self._on_asset_selected)
 
+        # 【新增】拖拽相关信号连接
+        self._grid.filesImported.connect(self._on_files_imported)
+        self._tree.filesDropped.connect(self._on_files_dropped_to_tree)
+
     # ================================================================
     #  工具栏
     # ================================================================
@@ -861,6 +913,10 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(path_label)
 
         # ── 路径显示框 ────────────────────────────────────────────
+        path_layout = QHBoxLayout()
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        path_layout.setSpacing(8)
+        
         self._path_display = QLineEdit(self._current_root)
         self._path_display.setReadOnly(True)
         self._path_display.setMinimumWidth(350)
@@ -880,7 +936,19 @@ class MainWindow(QMainWindow):
             }}
             """
         )
-        toolbar.addWidget(self._path_display)
+        path_layout.addWidget(self._path_display, 1)
+        
+        # 路径复制按钮
+        copy_path_btn = QToolButton()
+        copy_path_btn.setText("📋")
+        copy_path_btn.setToolTip("复制路径到剪贴板")
+        copy_path_btn.clicked.connect(self.copy_path_to_clipboard)
+        path_layout.addWidget(copy_path_btn)
+        
+        # 将布局添加到工具栏
+        path_widget = QWidget()
+        path_widget.setLayout(path_layout)
+        toolbar.addWidget(path_widget)
 
         # ── 弹性空间 ──────────────────────────────────────────────
         spacer = QWidget()
@@ -888,15 +956,16 @@ class MainWindow(QMainWindow):
         spacer.setStyleSheet("background: transparent;")
         toolbar.addWidget(spacer)
 
-        # ── 搜索框 ────────────────────────────────────────────────
+        # ── 全局搜索框 ────────────────────────────────────────────────
         search_icon = QLabel("🔍")
         search_icon.setStyleSheet("font-size: 13pt; padding-right: 4px;")
         toolbar.addWidget(search_icon)
 
-        self._search_box = QLineEdit()
-        self._search_box.setPlaceholderText("搜索资产...")
-        self._search_box.setFixedWidth(200)
-        self._search_box.setStyleSheet(
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("全局搜索资产（文件名模糊匹配）")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setMaximumWidth(300)
+        self.search_edit.setStyleSheet(
             f"""
             QLineEdit {{
                 background-color: {C_BG_INPUT};
@@ -917,8 +986,8 @@ class MainWindow(QMainWindow):
             }}
             """
         )
-        self._search_box.textChanged.connect(self._on_search_changed)
-        toolbar.addWidget(self._search_box)
+        self.search_edit.textChanged.connect(self.on_global_search)
+        toolbar.addWidget(self.search_edit)
 
     # ================================================================
     #  槽函数
@@ -986,6 +1055,41 @@ class MainWindow(QMainWindow):
             self._status_label.setText(f"搜索 \"{text}\"  ·  {visible} 个结果")
         else:
             self._status_label.setText("就绪")
+
+    def _on_files_imported(self, folder_path: str) -> None:
+        """网格区域有文件被拖入后，重新扫描并刷新。"""
+        self._status_label.setText(f"文件已导入到: {folder_path}")
+        # 重新触发扫描
+        self._on_folder_selected(folder_path)
+
+    def _on_files_dropped_to_tree(self, target_folder: str) -> None:
+        """文件被拖到树的某个文件夹后，刷新网格（如果当前正在显示源目录）。"""
+        self._status_label.setText(f"文件已移动到: {target_folder}")
+        # 刷新当前网格显示
+        current_display = self._path_display.text()
+        if current_display:
+            self._on_folder_selected(current_display)
+
+    def copy_path_to_clipboard(self) -> None:
+        """复制当前路径到剪贴板。"""
+        current_path = self._path_display.text()
+        if current_path:
+            QApplication.clipboard().setText(current_path)
+            self.statusBar().showMessage("路径已复制到剪贴板", 2000)
+
+    def on_global_search(self, text: str) -> None:
+        """全局搜索资产"""
+        if not text.strip():
+            # 如果搜索框为空，显示当前文件夹的资产
+            current_folder = self._path_display.text()
+            if current_folder:
+                self._on_folder_selected(current_folder)
+            return
+        
+        # 执行全局搜索
+        assets = self._db.search_assets(text.strip())
+        self._grid.load_assets(assets)
+        self._status_label.setText(f"搜索结果: {len(assets)} 个资产")
 
 
 # ══════════════════════════════════════════════════════════════════
